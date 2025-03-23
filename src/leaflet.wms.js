@@ -288,10 +288,36 @@ const wms = (function (L) {
      * See Leaflet license.
      */
     wms.CustomImageOverlay = L.ImageOverlay.extend({
+        // Add cache for image URLs
+        statics: {
+            _cache: new Map(),
+            _abortControllers: new Map(),
+            _cacheSize: 50,
+            
+            // Cache management
+            addToCache: function(url, objectUrl) {
+                if (this._cache.size >= this._cacheSize) {
+                    // Remove oldest entry
+                    const firstKey = this._cache.keys().next().value;
+                    URL.revokeObjectURL(this._cache.get(firstKey));
+                    this._cache.delete(firstKey);
+                }
+                this._cache.set(url, objectUrl);
+            },
+            
+            removeFromCache: function(url) {
+                if (this._cache.has(url)) {
+                    URL.revokeObjectURL(this._cache.get(url));
+                    this._cache.delete(url);
+                }
+            }
+        },
+
         initialize: function(url, bounds, options) {
             this._url = url;
             this._bounds = L.latLngBounds(bounds);
             this._headers = options.headers || {};
+            this._loading = false;
             L.setOptions(this, options);
         },
 
@@ -335,24 +361,72 @@ const wms = (function (L) {
         },
 
         _loadImage: function() {
-            fetch(this._url, {
-                headers: this._headers
-            })
-            .then(response => {
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-                return response.blob();
-            })
-            .then(blob => {
-                const objectURL = URL.createObjectURL(blob);
-                this._image.src = objectURL;
-                this._objectURL = objectURL;
-            })
-            .catch(error => {
-                console.error('Error loading image:', error);
-                this.fire('error');
+            // Cancel any pending request
+            this._cancelRequest();
+            
+            if (Object.keys(this._headers).length === 0) {
+                // If no custom headers, directly set the src
+                this._image.src = this._url;
+                return;
+            }
+
+            // Check cache first
+            if (this.constructor._cache.has(this._url)) {
+                this._image.src = this.constructor._cache.get(this._url);
+                return;
+            }
+
+            // Create abort controller for this request
+            this._abortController = new AbortController();
+            this.constructor._abortControllers.set(this._url, this._abortController);
+
+            // Set loading flag
+            this._loading = true;
+
+            // Use requestAnimationFrame to prevent too many concurrent requests
+            requestAnimationFrame(() => {
+                if (!this._loading) return; // Check if still needed
+
+                fetch(this._url, {
+                    headers: this._headers,
+                    signal: this._abortController.signal
+                })
+                .then(response => {
+                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                    return response.blob();
+                })
+                .then(blob => {
+                    if (!this._loading) {
+                        // Request was cancelled
+                        return;
+                    }
+                    const objectURL = URL.createObjectURL(blob);
+                    this.constructor.addToCache(this._url, objectURL);
+                    if (this._image) {
+                        this._image.src = objectURL;
+                    }
+                })
+                .catch(error => {
+                    if (error.name === 'AbortError') {
+                        // Request was cancelled, ignore
+                        return;
+                    }
+                    console.error('Error loading image:', error);
+                    this.fire('error');
+                })
+                .finally(() => {
+                    this._loading = false;
+                    this.constructor._abortControllers.delete(this._url);
+                });
             });
+        },
+
+        _cancelRequest: function() {
+            this._loading = false;
+            if (this._abortController) {
+                this._abortController.abort();
+                this.constructor._abortControllers.delete(this._url);
+            }
         },
 
         _reset: function() {
@@ -374,13 +448,15 @@ const wms = (function (L) {
         },
 
         onRemove: function(map) {
+            this._cancelRequest();
+            
             if (this._image && this._image.parentNode) {
                 this._image.parentNode.removeChild(this._image);
             }
-            if (this._objectURL) {
-                URL.revokeObjectURL(this._objectURL);
-                this._objectURL = null;
-            }
+            
+            // Don't revoke cached URLs immediately
+            // They're managed by the static cache
+            
             if (this.options.interactive) {
                 this.removeInteractiveTarget(this._image);
             }
@@ -446,6 +522,8 @@ const wms = (function (L) {
                 delete this._currentOverlay;
             }
             if (this._currentUrl) {
+                // Clean up cache when layer is removed
+                wms.CustomImageOverlay.removeFromCache(this._currentUrl);
                 delete this._currentUrl;
             }
         },
