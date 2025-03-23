@@ -299,6 +299,108 @@ wms.tileLayer = L.tileLayer.wms;
  * Portions of wms.Overlay are directly extracted from L.TileLayer.WMS.
  * See Leaflet license.
  */
+wms.CustomImageOverlay = L.ImageOverlay.extend({
+    initialize: function(url, bounds, options) {
+        this._url = url;
+        this._bounds = L.latLngBounds(bounds);
+        this._headers = options.headers || {};
+        L.setOptions(this, options);
+    },
+
+    onAdd: function(map) {
+        this._map = map;
+        
+        if (!this._image) {
+            this._initImage();
+        }
+
+        if (this.options.interactive) {
+            L.DomUtil.addClass(this._image, 'leaflet-interactive');
+            this.addInteractiveTarget(this._image);
+        }
+
+        map._panes.overlayPane.appendChild(this._image);
+        this._reset();
+        this._loadImage(); // Load image after adding to map
+    },
+
+    _initImage: function() {
+        const img = L.DomUtil.create('img', 'leaflet-image-layer ' + (this._zoomAnimated ? 'leaflet-zoom-animated' : ''));
+
+        img.onselectstart = L.Util.falseFn;
+        img.onmousemove = L.Util.falseFn;
+
+        if (this.options.crossOrigin || this.options.crossOrigin === '') {
+            img.crossOrigin = this.options.crossOrigin === true ? '' : this.options.crossOrigin;
+        }
+
+        if (this.options.zIndex) {
+            this._updateZIndex();
+        }
+
+        img.onload = () => {
+            this._reset();
+            this.fire('load');
+        };
+
+        this._image = img;
+    },
+
+    _loadImage: function() {
+        fetch(this._url, {
+            headers: this._headers
+        })
+        .then(response => {
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            return response.blob();
+        })
+        .then(blob => {
+            const objectURL = URL.createObjectURL(blob);
+            this._image.src = objectURL;
+            this._objectURL = objectURL;
+        })
+        .catch(error => {
+            console.error('Error loading image:', error);
+            this.fire('error');
+        });
+    },
+
+    _reset: function() {
+        if (!this._map || !this._image) {
+            return;
+        }
+
+        const bounds = new L.Bounds(
+            this._map.latLngToLayerPoint(this._bounds.getNorthWest()),
+            this._map.latLngToLayerPoint(this._bounds.getSouthEast())
+        );
+
+        const size = bounds.getSize();
+
+        L.DomUtil.setPosition(this._image, bounds.min);
+
+        this._image.style.width = size.x + 'px';
+        this._image.style.height = size.y + 'px';
+    },
+
+    onRemove: function(map) {
+        if (this._image && this._image.parentNode) {
+            this._image.parentNode.removeChild(this._image);
+        }
+        if (this._objectURL) {
+            URL.revokeObjectURL(this._objectURL);
+            this._objectURL = null;
+        }
+        if (this.options.interactive) {
+            this.removeInteractiveTarget(this._image);
+        }
+        this._map = null;
+        this._image = null;
+    }
+});
+
 wms.Overlay = L.Layer.extend({
     'defaultWmsParams': {
         'service': 'WMS',
@@ -317,7 +419,8 @@ wms.Overlay = L.Layer.extend({
         'opacity': 1,
         'isBack': false,
         'minZoom': 0,
-        'maxZoom': 18
+        'maxZoom': 18,
+        'headers': {}
     },
 
     'initialize': function(url, options) {
@@ -369,7 +472,6 @@ wms.Overlay = L.Layer.extend({
         if (!this._map) {
             return;
         }
-        // Determine image URL and whether it has changed since last update
         this.updateWmsParams();
         var url = this.getImageUrl();
         if (this._currentUrl == url) {
@@ -377,11 +479,15 @@ wms.Overlay = L.Layer.extend({
         }
         this._currentUrl = url;
 
-        // Keep current image overlay in place until new one loads
-        // (inspired by esri.leaflet)
         var bounds = this._map.getBounds();
-        var overlay = L.imageOverlay(url, bounds, {'opacity': 0});
+        var overlay = new wms.CustomImageOverlay(url, bounds, {
+            'opacity': 0,
+            'headers': this.options.headers || {}
+        });
+
+        // Add overlay to map immediately
         overlay.addTo(this._map);
+
         overlay.once('load', _swap, this);
         function _swap() {
             if (!this._map) {

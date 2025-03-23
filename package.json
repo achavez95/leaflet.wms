@@ -27,6 +27,6 @@
     "map"
   ],
   "dependencies": {
-    "uglify-js": "^2.7.3"
+    "uglify-js": "^3.17.4"
   }
 }
